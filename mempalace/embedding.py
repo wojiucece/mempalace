@@ -228,9 +228,12 @@ _EMBEDDINGGEMMA_BATCH_SIZE = 32
 # the EF name() to "ollama" and the vector dimension (e.g. qwen3-embedding:0.6b
 # → 1024d), so it requires `mempalace repair --yes` like any other embedder
 # change. Repair has no resume — see plan doc.
+# Base URL — 不要末尾加 `/api/embeddings`。如果用户从旧版 ChromaDB 文档复制带后缀的
+# URL，ChromaDB OllamaEmbeddingFunction.__init__ 自身有 `endswith("/api/embeddings")`
+# 兼容逻辑（剥后缀），所以这里不必再做 normalize。
 _OLLAMA_DEFAULT_URL = "http://localhost:11434"
 _OLLAMA_DEFAULT_MODEL = "qwen3-embedding:0.6b"
-_OLLAMA_DEFAULT_TIMEOUT = 60
+_OLLAMA_DEFAULT_TIMEOUT = 60  # 秒
 # Health-probe text: longer than a single token so models that special-case very
 # short inputs (some BERT-family tokenizers emit only [CLS]+[SEP]) still produce
 # a meaningful vector and surface real failure modes during probe.
@@ -437,8 +440,6 @@ def _build_ollama_ef():
 
     所有参数从环境变量读，没有就用合理默认。避免动 config.py。
     """
-    import os
-
     url = os.getenv("MEMPALACE_OLLAMA_URL", _OLLAMA_DEFAULT_URL)
     model_name = os.getenv("MEMPALACE_OLLAMA_MODEL", _OLLAMA_DEFAULT_MODEL)
     timeout_raw = os.getenv("MEMPALACE_OLLAMA_TIMEOUT")

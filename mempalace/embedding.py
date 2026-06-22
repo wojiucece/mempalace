@@ -220,6 +220,23 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
 
 
+# Ollama integration — delegates embedding to a local Ollama server via ChromaDB's
+# native OllamaEmbeddingFunction. Activated by MEMPALACE_EMBEDDING_MODEL=ollama.
+# Unlike minilm/embeddinggemma, no model is loaded in-process: vectors come from
+# a single HTTP call per batch to Ollama, so onnxruntime providers/devices are
+# irrelevant for this path. Switching an existing palace to ollama changes both
+# the EF name() to "ollama" and the vector dimension (e.g. qwen3-embedding:0.6b
+# → 1024d), so it requires `mempalace repair --yes` like any other embedder
+# change. Repair has no resume — see plan doc.
+_OLLAMA_DEFAULT_URL = "http://localhost:11434"
+_OLLAMA_DEFAULT_MODEL = "qwen3-embedding:0.6b"
+_OLLAMA_DEFAULT_TIMEOUT = 60
+# Health-probe text: longer than a single token so models that special-case very
+# short inputs (some BERT-family tokenizers emit only [CLS]+[SEP]) still produce
+# a meaningful vector and surface real failure modes during probe.
+_OLLAMA_HEALTH_PROBE = "mempalace embedding health check"
+
+
 class EmbeddinggemmaONNX:
     """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL→384d).
 

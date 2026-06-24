@@ -14,14 +14,18 @@ health probe——让 embedding.py 只看到一个简单入口 ensure_running()�
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from urllib.parse import urlparse
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 # Win32 API 常量
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
@@ -123,6 +127,13 @@ def _resolve_paths() -> None:
 
 _LLAMACPP_DEFAULT_URL = "http://localhost:8080"
 _LLAMACPP_DEFAULT_TIMEOUT = 60  # 秒，HTTP 请求超时
+
+# spawn 后等待 ready 的总预算
+_READY_TIMEOUT_SECONDS = 30
+_READY_POLL_INTERVAL = 0.1
+
+# 模块级：已经 spawn 出来的 Popen 对象（避免重复 spawn）
+_spawned_proc: subprocess.Popen | None = None
 
 
 def _resolve_url() -> str:
@@ -238,3 +249,150 @@ def _bind_to_job_object(proc: subprocess.Popen) -> None:
             )
     finally:
         k32.CloseHandle(proc_handle)
+
+
+def ensure_running() -> str:
+    """保证有一个就绪的 llama-server，返回其 URL。
+
+    幂等：调用多次只会真正 spawn 一次。流程：
+      1. fail-fast 校验路径
+      2. 探测目标 URL 上是否已有 llama-server
+         - ready：复用
+         - loading：等（已有 server 在 warmup，不要再 spawn）
+         - foreign：报错（不抢占端口）
+         - 空闲：spawn 自己的
+      3. 轮询 /health 直到 ready（最长 30s）
+    """
+    _resolve_paths()
+    url = _resolve_url()
+
+    # 已经 spawn 过且还活着 → 复用
+    global _spawned_proc
+    if _spawned_proc is not None and _spawned_proc.poll() is None:
+        return url
+
+    probe_result = _probe_existing_server(url)
+    if probe_result == "ready":
+        logger.info("复用 %s 上已有的 llama-server", url)
+        return url
+    if probe_result == "loading":
+        # 已经有一个 server 在加载（上次 mempalace 留的或用户手动启的）。
+        # 不要再 spawn（端口会冲突），直接等它就绪。
+        logger.info("%s 上已有 llama-server 在加载，等待就绪", url)
+        _wait_until_ready(url)
+        return url
+    if probe_result == "foreign":
+        raise RuntimeError(
+            f"端口 {_resolve_port(url)} 被非 llama-server 进程占用。"
+            f"请释放该端口，或修改 MEMPALACE_LLAMACPP_URL 指向其他端口。"
+        )
+
+    # 空闲，自己起一个
+    _spawned_proc = _spawn(url)
+    _bind_to_job_object(_spawned_proc)
+    _wait_until_ready(url)
+    return url
+
+
+def _spawn(url: str) -> subprocess.Popen:
+    """启动 llama-server 子进程，stdout/stderr 重定向到日志文件。
+
+    注意：log_fh（open 返回的文件句柄）在传递给 Popen 后没有显式 close()。
+    这是有意为之——子进程接管了该 fd，Python 端关闭句柄会导致子进程的
+    stdout 也跟着损坏。Windows 上 Popen 内部会 DuplicateHandle，子进程
+    持有引用时 Python 端的 close 是安全的，但显式 close 仍有风险。
+    让 GC 在子进程退出后自然回收即可。
+    """
+    port = _resolve_port(url)
+    cache = os.environ["MODELSCOPE_CACHE"]  # _resolve_paths 已校验存在
+    gguf_path = (
+        Path(cache)
+        / "models"
+        / "Qwen"
+        / "Qwen3-Embedding-0___6B-GGUF"
+        / "Qwen3-Embedding-0.6B-Q8_0.gguf"
+    )
+
+    args = [
+        str(_LLAMA_SERVER_BIN),
+        "-m",
+        str(gguf_path),
+        "--embedding",
+        "--port",
+        str(port),
+        "--pooling",
+        "mean",
+        "-ub",
+        "2048",
+        "-ngl",
+        "0",
+    ]
+
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # append 模式：保留历史 spawn 的日志方便排查；不用 PIPE 避免缓冲区满阻塞
+    log_fh = open(_LOG_PATH, "a", buffering=1, encoding="utf-8")
+    log_fh.write(f"\n=== mempalace spawn at {time.time():.0f} ===\n")
+    log_fh.flush()
+
+    logger.info("spawn llama-server: %s", " ".join(args))
+    proc = subprocess.Popen(
+        args,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        # Windows: 不创建新控制台窗口（mempalace CLI 已经在终端里）
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    return proc
+
+
+def _wait_until_ready(url: str) -> None:
+    """轮询 /health 直到返回 ready（200 + status:ok），最长 30s。
+
+    loading 状态视为"继续等"。foreign 状态视为"被劫持"立刻 fail。
+    """
+    deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        probe = _probe_existing_server(url, timeout=1.0)
+        if probe == "ready":
+            logger.info("llama-server 在 %s 就绪", url)
+            return
+        if probe == "foreign":
+            # 中途被无关进程顶替了端口（极端情况，但要 fail-fast）
+            tail = _read_log_tail(20)
+            raise RuntimeError(
+                f"llama-server 还在加载时 {url} 被非 llama-server 进程顶替。\n"
+                f"日志尾部 ({_LOG_PATH})：\n{tail}"
+            )
+        # loading / None：继续等
+        time.sleep(_READY_POLL_INTERVAL)
+
+    # 超时：把日志尾部贴进异常信息
+    tail = _read_log_tail(20)
+    raise RuntimeError(
+        f"llama-server 在 {_READY_TIMEOUT_SECONDS}s 内未就绪。\n日志尾部 ({_LOG_PATH})：\n{tail}"
+    )
+
+
+def _read_log_tail(n_lines: int) -> str:
+    """读 log 文件最后 n 行（拼到错误信息里）。
+
+    策略：seek 到末尾前 4KB 读取，按 \\n 分割取最后 n 个非空行。
+    不读整个文件——日志可能很大（spawn 历史累积），整读会慢。
+    不要求 line buffering 完整——llama-server 可能正在 flush 中途，
+    截断的第一行直接丢弃（一行 truncate 影响诊断价值 << 实现复杂度）。
+    """
+    try:
+        size = _LOG_PATH.stat().st_size
+        with open(_LOG_PATH, "rb") as f:
+            # seek 到末尾前 4KB（或文件开头，取较大者）
+            f.seek(max(0, size - 4096))
+            chunk = f.read().decode("utf-8", errors="replace")
+        # 拆行；如果 seek 落在某行中间，第一行残缺，扔掉
+        lines = [ln for ln in chunk.split("\n") if ln.strip()]
+        if size > 4096 and lines:
+            lines = lines[1:]  # 第一行可能 truncate，扔
+        if not lines:
+            return "(日志为空，llama-server 可能还没产生输出)"
+        return "\n".join(lines[-n_lines:])
+    except FileNotFoundError:
+        return "(日志文件不存在)"

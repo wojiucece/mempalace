@@ -181,3 +181,41 @@ def test_bind_to_job_object_windows_creates_job():
         assert mock_k32.SetInformationJobObject.called
         assert mock_k32.AssignProcessToJobObject.called
         assert mock_k32.OpenProcess.called
+
+
+def test_ensure_running_reuses_existing(monkeypatch, tmp_path):
+    """已有 ready 状态的 llama-server → 复用，不 spawn"""
+    monkeypatch.setenv("MODELSCOPE_CACHE", str(tmp_path))
+    monkeypatch.setenv("MEMPALACE_LLAMACPP_URL", "http://localhost:8080")
+    # 准备假 GGUF
+    gguf_dir = tmp_path / "models" / "Qwen" / "Qwen3-Embedding-0___6B-GGUF"
+    gguf_dir.mkdir(parents=True)
+    (gguf_dir / "Qwen3-Embedding-0.6B-Q8_0.gguf").write_bytes(b"fake")
+
+    from mempalace import _llamacpp_server
+
+    with patch.object(
+        _llamacpp_server, "_LLAMA_SERVER_BIN", Path(__file__).parent / "test_llamacpp_server.py"
+    ):
+        with patch.object(_llamacpp_server, "_probe_existing_server", return_value="ready"):
+            with patch("subprocess.Popen") as mock_popen:
+                url = _llamacpp_server.ensure_running()
+                assert url == "http://localhost:8080"
+                mock_popen.assert_not_called()  # 关键：没 spawn
+
+
+def test_ensure_running_rejects_foreign_server(monkeypatch, tmp_path):
+    """端口被无关进程占了 → fail-fast，不强行 spawn"""
+    monkeypatch.setenv("MODELSCOPE_CACHE", str(tmp_path))
+    gguf_dir = tmp_path / "models" / "Qwen" / "Qwen3-Embedding-0___6B-GGUF"
+    gguf_dir.mkdir(parents=True)
+    (gguf_dir / "Qwen3-Embedding-0.6B-Q8_0.gguf").write_bytes(b"fake")
+
+    from mempalace import _llamacpp_server
+
+    with patch.object(
+        _llamacpp_server, "_LLAMA_SERVER_BIN", Path(__file__).parent / "test_llamacpp_server.py"
+    ):
+        with patch.object(_llamacpp_server, "_probe_existing_server", return_value="foreign"):
+            with pytest.raises(RuntimeError, match="非 llama-server|foreign|占用"):
+                _llamacpp_server.ensure_running()

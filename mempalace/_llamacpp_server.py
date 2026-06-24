@@ -13,12 +13,70 @@ health probe——让 embedding.py 只看到一个简单入口 ensure_running()�
 
 from __future__ import annotations
 
+import ctypes
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from urllib.parse import urlparse
 
 import requests
+
+# Win32 API 常量
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+
+
+# Win32 Job Object 结构体。提到模块顶层避免在 _bind_to_job_object 每次调用
+# 都重建 class（Python 反模式 + 微小性能浪费）。三个 Structure 互相嵌套，
+# 必须按依赖顺序定义。
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+# 模块级 job handle：mempalace 进程整个生命周期共享一个 job，
+# 所有 spawn 的 llama-server 绑到同一个 job 上。父死 → job 关闭 → 全部子进程一起死。
+#
+# 关于"绑直接子进程是否覆盖孙进程"：Windows Job Object 是继承式的。一旦
+# llama-server 被加入 job，它后续 spawn 的任何子进程都自动在同一 job 里
+# （除非显式 CREATE_BREAKAWAY_FROM_JOB）。llama.cpp 不用这个标志，所以
+# 整个进程树都受 KILL_ON_JOB_CLOSE 保护，无须额外代码。
+_job_handle: int | None = None
 
 # llama-server.exe 路径：fork 自留，硬编码（参见 ADR 已知技术债）
 _LLAMA_SERVER_BIN = Path("D:/llama/llama-server.exe")
@@ -128,3 +186,53 @@ def _probe_existing_server(url: str, timeout: float = 2.0) -> str | None:
             return "loading"
 
     return "foreign"
+
+
+def _bind_to_job_object(proc: subprocess.Popen) -> None:
+    """把子进程绑到 mempalace 的 Job Object 上。
+
+    仅 Windows 实现。fork 实际只跑 Windows，Linux/Mac 直接 fail-fast
+    退出，不画饼。第一次调用时创建 job 并设置 KILL_ON_JOB_CLOSE 标志，
+    后续调用复用同一个 job。
+    """
+    if sys.platform != "win32":
+        raise RuntimeError(
+            "_bind_to_job_object 仅支持 Windows（Windows-only）。"
+            "fork 当前不投资 Linux/Mac 上的 llama-server 进程清理。"
+        )
+
+    global _job_handle
+    k32 = ctypes.windll.kernel32
+
+    if _job_handle is None:
+        # 创建 job
+        _job_handle = k32.CreateJobObjectW(None, None)
+        if not _job_handle:
+            raise RuntimeError(f"CreateJobObjectW 失败，GetLastError={ctypes.get_last_error()}")
+
+        # 设置 KILL_ON_JOB_CLOSE：mempalace 退出 → job 句柄关闭 → 子进程全杀
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(
+            _job_handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise RuntimeError(
+                f"SetInformationJobObject 失败，GetLastError={ctypes.get_last_error()}"
+            )
+
+    # 把子进程加到 job
+    proc_handle = k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, proc.pid)
+    if not proc_handle:
+        raise RuntimeError(
+            f"OpenProcess 失败 (pid={proc.pid})，GetLastError={ctypes.get_last_error()}"
+        )
+    try:
+        if not k32.AssignProcessToJobObject(_job_handle, proc_handle):
+            raise RuntimeError(
+                f"AssignProcessToJobObject 失败，GetLastError={ctypes.get_last_error()}"
+            )
+    finally:
+        k32.CloseHandle(proc_handle)

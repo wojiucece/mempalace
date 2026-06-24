@@ -1,4 +1,7 @@
+"""llamacpp_server 模块测试。"""
+
 import pytest
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -144,3 +147,36 @@ def test_probe_existing_server_foreign_response():
     with patch("requests.get", return_value=fake_resp):
         result = _llamacpp_server._probe_existing_server("http://localhost:8080")
     assert result == "foreign"
+
+
+def test_bind_to_job_object_non_windows_fail_fast():
+    """非 Windows 平台 fail-fast（fork 不投资 Linux/Mac 进程清理）"""
+    from mempalace import _llamacpp_server
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+    with patch.object(sys, "platform", "linux"):
+        with pytest.raises(RuntimeError, match="仅支持 Windows|Windows-only"):
+            _llamacpp_server._bind_to_job_object(fake_proc)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only")
+def test_bind_to_job_object_windows_creates_job():
+    """Windows 上调用 Win32 API（用 mock 验证调用顺序）"""
+    from mempalace import _llamacpp_server
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+
+    # 验证三步：CreateJobObjectW → SetInformationJobObject → AssignProcessToJobObject
+    with patch("ctypes.windll.kernel32") as mock_k32:
+        mock_k32.CreateJobObjectW.return_value = 0xABCD  # 假 handle
+        mock_k32.SetInformationJobObject.return_value = 1  # 成功
+        mock_k32.OpenProcess.return_value = 0x1234
+        mock_k32.AssignProcessToJobObject.return_value = 1
+
+        _llamacpp_server._bind_to_job_object(fake_proc)
+
+        assert mock_k32.CreateJobObjectW.called
+        assert mock_k32.SetInformationJobObject.called
+        assert mock_k32.AssignProcessToJobObject.called

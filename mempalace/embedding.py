@@ -221,26 +221,6 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 # does not change any row's vector.
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
 
-
-# Ollama integration — delegates embedding to a local Ollama server via ChromaDB's
-# native OllamaEmbeddingFunction. Activated by MEMPALACE_EMBEDDING_MODEL=ollama.
-# Unlike minilm/embeddinggemma, no model is loaded in-process: vectors come from
-# a single HTTP call per batch to Ollama, so onnxruntime providers/devices are
-# irrelevant for this path. Switching an existing palace to ollama changes both
-# the EF name() to "ollama" and the vector dimension (e.g. qwen3-embedding:0.6b
-# → 1024d), so it requires `mempalace repair --yes` like any other embedder
-# change. Repair has no resume — see plan doc.
-# Base URL — 不要末尾加 `/api/embeddings`。如果用户从旧版 ChromaDB 文档复制带后缀的
-# URL，ChromaDB OllamaEmbeddingFunction.__init__ 自身有 `endswith("/api/embeddings")`
-# 兼容逻辑（剥后缀），所以这里不必再做 normalize。
-_OLLAMA_DEFAULT_URL = "http://localhost:11434"
-_OLLAMA_DEFAULT_MODEL = "qwen3-embedding:0.6b"
-_OLLAMA_DEFAULT_TIMEOUT = 60  # 秒
-# Health-probe text: longer than a single token so models that special-case very
-# short inputs (some BERT-family tokenizers emit only [CLS]+[SEP]) still produce
-# a meaningful vector and surface real failure modes during probe.
-_OLLAMA_HEALTH_PROBE = "mempalace embedding health check"
-
 # llama.cpp embedding backend -- 通过 mempalace 自管的 llama-server 子进程
 # 做 embedding。激活方式：MEMPALACE_EMBEDDING_MODEL=llamacpp。
 #
@@ -534,52 +514,6 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         model,
         effective,
         providers,
-    )
-    return ef
-
-
-def _build_ollama_ef():
-    """构造 ChromaDB 自带的 OllamaEmbeddingFunction，并做 fail-fast 健康探测。
-
-    Why 健康探测：OllamaEmbeddingFunction.__init__ 只创建 ollama.Client，
-    并不发起 HTTP 请求；服务/模型不可达要等到首次 __call__ 才暴露。
-    这让 mempalace 各异步调用点（miner、search、mcp）报错时机不一、
-    诊断困难。我们在工厂里显式 embed() 一次，确保只要本函数返回成功，
-    后续调用就能用——不可达直接 raise，绝不静默回退到 minilm。
-
-    所有参数从环境变量读，没有就用合理默认。避免动 config.py。
-    """
-    url = os.getenv("MEMPALACE_OLLAMA_URL", _OLLAMA_DEFAULT_URL)
-    model_name = os.getenv("MEMPALACE_OLLAMA_MODEL", _OLLAMA_DEFAULT_MODEL)
-    timeout_raw = os.getenv("MEMPALACE_OLLAMA_TIMEOUT")
-    try:
-        timeout = int(timeout_raw) if timeout_raw else _OLLAMA_DEFAULT_TIMEOUT
-    except ValueError as e:
-        raise ValueError(f"MEMPALACE_OLLAMA_TIMEOUT 必须是整数，收到 {timeout_raw!r}") from e
-    if timeout <= 0:
-        raise ValueError(f"MEMPALACE_OLLAMA_TIMEOUT 必须是正整数，收到 {timeout}")
-
-    from chromadb.utils.embedding_functions.ollama_embedding_function import (
-        OllamaEmbeddingFunction,
-    )
-
-    ef = OllamaEmbeddingFunction(url=url, model_name=model_name, timeout=timeout)
-
-    # 健康探测：让 Ollama 服务/模型不可达问题立刻暴露
-    try:
-        ef([_OLLAMA_HEALTH_PROBE])
-    except Exception as e:
-        raise RuntimeError(
-            f"Ollama embedding 服务健康探测失败 "
-            f"(url={url}, model={model_name}, timeout={timeout}s): {e}. "
-            f"请检查 Ollama 服务是否在运行、模型是否已 `ollama pull {model_name}`。"
-        ) from e
-
-    logger.info(
-        "Ollama embedding function initialized (url=%s model=%s timeout=%ds)",
-        url,
-        model_name,
-        timeout,
     )
     return ef
 

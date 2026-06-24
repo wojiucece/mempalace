@@ -16,6 +16,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from urllib.parse import urlparse
+
+import requests
+
 # llama-server.exe 路径：fork 自留，硬编码（参见 ADR 已知技术债）
 _LLAMA_SERVER_BIN = Path("D:/llama/llama-server.exe")
 
@@ -58,3 +62,64 @@ def _resolve_paths() -> None:
 
 # 模块顶层不再暴露具体 GGUF 路径常量——_resolve_paths() 内部重新构造，
 # 是因为测试需要靠 monkeypatch 改 MODELSCOPE_CACHE 来覆盖三种失败分支。
+
+_LLAMACPP_DEFAULT_URL = "http://localhost:8080"
+_LLAMACPP_DEFAULT_TIMEOUT = 60  # 秒，HTTP 请求超时
+
+
+def _resolve_url() -> str:
+    """读 MEMPALACE_LLAMACPP_URL，校验合法性。
+
+    校验项：
+    - host 不为空、不为 0.0.0.0（client 目标地址不能是 wildcard）
+    - 必须带端口（spawn 时用作 --port 的来源）
+    """
+    url = os.getenv("MEMPALACE_LLAMACPP_URL", _LLAMACPP_DEFAULT_URL)
+    parsed = urlparse(url)
+    if not parsed.hostname or parsed.hostname == "0.0.0.0":
+        raise RuntimeError(
+            f"MEMPALACE_LLAMACPP_URL 的 host 必须是具体地址，不能为空或 0.0.0.0。当前值：{url}"
+        )
+    if parsed.port is None:
+        raise RuntimeError(
+            f"MEMPALACE_LLAMACPP_URL 必须显式带端口（spawn 时用作 --port 参数源）。当前值：{url}"
+        )
+    return url
+
+
+def _resolve_port(url: str) -> int:
+    """从 URL 抽出端口号。"""
+    return urlparse(url).port  # type: ignore[return-value]
+
+
+def _probe_existing_server(url: str, timeout: float = 2.0) -> str | None:
+    """探测 URL 上是否已经有 llama-server 在跑。
+
+    返回值（README 在 b9768 上承诺这两个状态码）：
+      - "ready":   200 + {"status":"ok"}                  llama-server 就绪，可用
+      - "loading": 503 + {"error":{"message":"Loading model",...}}
+                                                          llama-server 还在加载（等就行）
+      - "foreign": 其他响应（被无关进程占了）
+      - None:      连接失败 / 超时（端口空闲，可以 spawn）
+    """
+    try:
+        resp = requests.get(f"{url}/health", timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
+
+    try:
+        body = resp.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        return "foreign"  # 不是 JSON → Nginx / Tomcat 默认页
+
+    # llama-server ready
+    if resp.status_code == 200 and isinstance(body, dict) and body.get("status") == "ok":
+        return "ready"
+
+    # llama-server still loading model (README 承诺的 503)
+    if resp.status_code == 503 and isinstance(body, dict):
+        err = body.get("error", {})
+        if isinstance(err, dict) and "Loading model" in str(err.get("message", "")):
+            return "loading"
+
+    return "foreign"

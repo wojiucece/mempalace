@@ -203,6 +203,8 @@ def _bind_to_job_object(proc: subprocess.Popen) -> None:
 
     global _job_handle
     k32 = ctypes.windll.kernel32
+    k32.CreateJobObjectW.restype = ctypes.c_void_p
+    k32.OpenProcess.restype = ctypes.c_void_p
 
     if _job_handle is None:
         # 创建 job

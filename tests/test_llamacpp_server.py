@@ -180,3 +180,4 @@ def test_bind_to_job_object_windows_creates_job():
         assert mock_k32.CreateJobObjectW.called
         assert mock_k32.SetInformationJobObject.called
         assert mock_k32.AssignProcessToJobObject.called
+        assert mock_k32.OpenProcess.called

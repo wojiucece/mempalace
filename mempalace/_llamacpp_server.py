@@ -33,14 +33,14 @@ def _resolve_paths() -> None:
     cache = os.getenv("MODELSCOPE_CACHE")
     if not cache:
         raise RuntimeError(
-            "环境变量 MODELSCOPE_CACHE 未设置。"
-            "请设置为 ModelScope 缓存目录，例如 D:/modelscope"
+            "环境变量 MODELSCOPE_CACHE 未设置。请设置为 ModelScope 缓存目录，例如 D:/modelscope"
         )
 
     gguf_path = (
         Path(cache)
         / "models"
-        / "Qwen" / "Qwen3-Embedding-0___6B-GGUF"
+        / "Qwen"
+        / "Qwen3-Embedding-0___6B-GGUF"
         / "Qwen3-Embedding-0.6B-Q8_0.gguf"
     )
     if not gguf_path.is_file():

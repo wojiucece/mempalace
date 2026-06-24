@@ -1,4 +1,3 @@
-import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +7,7 @@ def test_resolve_paths_missing_modelscope_cache(monkeypatch):
     """MODELSCOPE_CACHE 没设 → fail-fast"""
     monkeypatch.delenv("MODELSCOPE_CACHE", raising=False)
     from mempalace import _llamacpp_server
+
     with pytest.raises(RuntimeError, match="MODELSCOPE_CACHE"):
         _llamacpp_server._resolve_paths()
 
@@ -16,6 +16,7 @@ def test_resolve_paths_missing_gguf(tmp_path, monkeypatch):
     """GGUF 文件不存在 → fail-fast，错误信息提示 ModelScope 下载"""
     monkeypatch.setenv("MODELSCOPE_CACHE", str(tmp_path))
     from mempalace import _llamacpp_server
+
     with pytest.raises(RuntimeError, match=r"GGUF.*ModelScope|ModelScope.*GGUF"):
         _llamacpp_server._resolve_paths()
 
@@ -27,8 +28,11 @@ def test_resolve_paths_missing_llama_server(tmp_path, monkeypatch):
     gguf_dir.mkdir(parents=True)
     (gguf_dir / "Qwen3-Embedding-0.6B-Q8_0.gguf").write_bytes(b"fake")
     monkeypatch.setenv("MODELSCOPE_CACHE", str(tmp_path))
-    # patch _LLAMA_SERVER_BIN to point to a non-existent path
+    # 将 _LLAMA_SERVER_BIN 指向不存在的路径以触发校验失败
     from mempalace import _llamacpp_server
-    with patch.object(_llamacpp_server, "_LLAMA_SERVER_BIN", Path("Z:/nonexistent/llama-server.exe")):
+
+    with patch.object(
+        _llamacpp_server, "_LLAMA_SERVER_BIN", Path("Z:/nonexistent/llama-server.exe")
+    ):
         with pytest.raises(RuntimeError, match="llama-server"):
             _llamacpp_server._resolve_paths()

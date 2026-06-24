@@ -253,3 +253,55 @@ def test_llamacpp_ef_empty_input_skips_request(monkeypatch):
         assert ef([]) == []
         assert ef(None) == []
         mock_post.assert_not_called()
+
+
+def test_llamacpp_ef_internal_batch_chunking(monkeypatch):
+    """超过 _LLAMACPP_MAX_BATCH 的输入按 32 条/批切分，按顺序拼回。
+
+    Regression: mempalace `repair --mode from-sqlite` 直接 upsert 整个 1449
+    条 list，原实现单次 POST 导致 llama-server 端真在算但客户端 read timeout。
+    本测试确保 EF 内部按 32 切片、多次 POST、结果按 input 顺序拼回。
+    """
+    from unittest.mock import patch, MagicMock
+    from mempalace.embedding import LlamacppEF, _LLAMACPP_MAX_BATCH
+
+    assert _LLAMACPP_MAX_BATCH == 32, "测试假设 batch=32；上限改了请同步更新"
+
+    # 构造 40 条输入 → 应触发 2 次 POST：第一批 32 条 + 第二批 8 条
+    inputs = [f"text-{i}" for i in range(40)]
+
+    def fake_post(url, json, timeout):
+        # 按 mempalace b9768 实测响应格式回 mock：响应根是 list，
+        # 每项 {"index": i, "embedding": [[1024 floats]]}
+        content = json["content"]
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            # 用 input 字符串的索引值填进 vector[0]，便于验证顺序
+            {"index": i, "embedding": [[float(int(text.split("-")[1]))] + [0.0] * 1023]}
+            for i, text in enumerate(content)
+        ]
+        return resp
+
+    with patch("requests.post", side_effect=fake_post) as mock_post:
+        ef = LlamacppEF(url="http://localhost:8080", timeout=60)
+        result = ef(inputs)
+
+    # 必须发 2 次 HTTP
+    assert mock_post.call_count == 2
+    # 第一次 POST 32 条
+    first_payload = mock_post.call_args_list[0].kwargs["json"]["content"]
+    assert len(first_payload) == 32
+    assert first_payload[0] == "text-0"
+    assert first_payload[31] == "text-31"
+    # 第二次 POST 8 条
+    second_payload = mock_post.call_args_list[1].kwargs["json"]["content"]
+    assert len(second_payload) == 8
+    assert second_payload[0] == "text-32"
+    assert second_payload[7] == "text-39"
+    # 返回 40 条向量，且按 input 顺序拼回
+    assert len(result) == 40
+    assert result[0][0] == 0.0
+    assert result[31][0] == 31.0
+    assert result[32][0] == 32.0
+    assert result[39][0] == 39.0

@@ -313,6 +313,16 @@ def _spawn(url: str) -> subprocess.Popen:
         / "Qwen3-Embedding-0.6B-Q8_0.gguf"
     )
 
+    # 启动参数写死。调优依据（i5-12500H + 16GB + CPU 推理）：
+    #   --threads 8        避开 P 核（8 逻辑线程）+ E 核大小核调度陷阱
+    #   --ctx-size 2048    embedding 不需要 32k 上下文；砍到 2k 让 KV cache
+    #                      从 ~896MB 降到 ~56MB，根治 Windows 大块连续内存
+    #                      分配的 0xc0000005 崩溃
+    #   --batch-size 512 / --ubatch-size 512
+    #                      AVX2 甜点值；笔记本 CPU 单批延迟 < 100ms
+    #   --no-mmap          16GB RAM、模型 700MB，直接全量装内存避免 page fault
+    #   --parallel 2       i5-12500H 同时跑 2 个 512 batch 不堵塞
+    #   --flash-attn       llama.cpp 也有 CPU FA 优化，~10-20% 提速
     args = [
         str(_LLAMA_SERVER_BIN),
         "-m",
@@ -322,8 +332,18 @@ def _spawn(url: str) -> subprocess.Popen:
         str(port),
         "--pooling",
         "mean",
-        "-ub",
+        "--threads",
+        "8",
+        "--ctx-size",
         "2048",
+        "--batch-size",
+        "512",
+        "--ubatch-size",
+        "512",
+        "--no-mmap",
+        "--parallel",
+        "2",
+        "--flash-attn",
         "-ngl",
         "0",
     ]

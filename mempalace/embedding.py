@@ -236,6 +236,15 @@ _EMBEDDINGGEMMA_BATCH_SIZE = 32
 # 必须 mempalace repair --yes 重建索引。
 _LLAMACPP_HEALTH_PROBE = "mempalace embedding health check"
 
+# 客户端内部 batch 切分上限。
+# 历史：原本假设调用方（ChromaDB / mempalace）已切好 batch，但 mempalace 的
+# `repair --mode from-sqlite` 直接 upsert(documents=<1449 条整 list>) 不做切分，
+# 导致单次 HTTP POST /embeddings 含上千条文本、llama-server 真在算但客户端 HTTP
+# read timeout（即便 timeout=600s 也不够）。
+# 取值理由：跟 mempalace ChromaDB 内部 ONNX EF 的 batch_size=32 对齐，drawer 平均
+# 几百 token，32 条 × 500 token ≈ 16k token，远低于 llama-server -b 8192 等参数限制。
+_LLAMACPP_MAX_BATCH = 32
+
 
 class LlamacppEF:
     """ChromaDB-compatible EF，调用本地 llama-server 的 /embeddings 端点（带 s，非 OAI 兼容版）。
@@ -243,12 +252,10 @@ class LlamacppEF:
     实例化时不立刻发请求；首次调用 __call__ 时通过
     _llamacpp_server.ensure_running() 保证服务在跑（lazy spawn）。
 
-    Batch chunking 边界：本类**不做内部 batch 切分**，假设调用方
-    （ChromaDB / mempalace miner / searcher）已按合理大小切好。
-    ChromaDB 内部 ONNX EF 用 batch_size=32 的语义在这里同样适用——
-    实际 mempalace 调用点的 batch ≤ 几十条 drawer，远低于会让单次
-    HTTP POST 出问题的规模。如果未来有人直接传 1000+ 条进来，要么
-    在调用方加切分，要么改这里。
+    Batch chunking：__call__ 内部按 _LLAMACPP_MAX_BATCH 切片，每片一次
+    HTTP POST，结果按 input 顺序拼回。这是为了适配 mempalace `repair
+    --mode from-sqlite` 这种"整 list 直接 upsert"的调用方式——见上面常量
+    注释里的历史。
     """
 
     def __init__(self, url: str, timeout: int):
@@ -276,13 +283,17 @@ class LlamacppEF:
         if not input:
             return []
 
-        resp = requests.post(
-            f"{self._url}/embeddings",  # 带 s，非 OAI 兼容端点
-            json={"content": list(input)},
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
-        return [item["embedding"][0] for item in resp.json()]
+        results: list[list[float]] = []
+        for start in range(0, len(input), _LLAMACPP_MAX_BATCH):
+            chunk = list(input[start : start + _LLAMACPP_MAX_BATCH])
+            resp = requests.post(
+                f"{self._url}/embeddings",  # 带 s，非 OAI 兼容端点
+                json={"content": chunk},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            results.extend(item["embedding"][0] for item in resp.json())
+        return results
 
     def embed_query(self, input):  # noqa: A002
         return self(input)

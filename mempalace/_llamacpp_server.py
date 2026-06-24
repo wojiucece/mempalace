@@ -79,17 +79,22 @@ def _resolve_url() -> str:
     if not parsed.hostname or parsed.hostname == "0.0.0.0":
         raise RuntimeError(
             f"MEMPALACE_LLAMACPP_URL 的 host 必须是具体地址，不能为空或 0.0.0.0。当前值：{url}"
+            f"。例如：MEMPALACE_LLAMACPP_URL=http://localhost:8080"
         )
     if parsed.port is None:
         raise RuntimeError(
             f"MEMPALACE_LLAMACPP_URL 必须显式带端口（spawn 时用作 --port 参数源）。当前值：{url}"
+            f"。例如：MEMPALACE_LLAMACPP_URL=http://localhost:8080"
         )
     return url
 
 
 def _resolve_port(url: str) -> int:
     """从 URL 抽出端口号。"""
-    return urlparse(url).port  # type: ignore[return-value]
+    port = urlparse(url).port
+    if port is None:
+        raise RuntimeError(f"URL 必须带端口：{url}。例如：http://localhost:8080")
+    return port
 
 
 def _probe_existing_server(url: str, timeout: float = 2.0) -> str | None:
@@ -112,11 +117,11 @@ def _probe_existing_server(url: str, timeout: float = 2.0) -> str | None:
     except (ValueError, requests.exceptions.JSONDecodeError):
         return "foreign"  # 不是 JSON → Nginx / Tomcat 默认页
 
-    # llama-server ready
+    # llama-server 就绪
     if resp.status_code == 200 and isinstance(body, dict) and body.get("status") == "ok":
         return "ready"
 
-    # llama-server still loading model (README 承诺的 503)
+    # llama-server 仍在加载模型（README 承诺的 503）
     if resp.status_code == 503 and isinstance(body, dict):
         err = body.get("error", {})
         if isinstance(err, dict) and "Loading model" in str(err.get("message", "")):

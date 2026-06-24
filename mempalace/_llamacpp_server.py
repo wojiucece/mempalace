@@ -344,6 +344,7 @@ def _spawn(url: str) -> subprocess.Popen:
         "--parallel",
         "2",
         "--flash-attn",
+        "on",
         "-ngl",
         "0",
     ]

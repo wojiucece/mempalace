@@ -192,3 +192,64 @@ def test_describe_device_uses_resolved_effective_device(monkeypatch):
     )
 
     assert embedding.describe_device("auto") == "cuda"
+
+
+def test_llamacpp_ef_name():
+    """EF name 必须固定为 llamacpp（ChromaDB 用它当 collection 身份证）"""
+    from mempalace.embedding import LlamacppEF
+
+    ef = LlamacppEF(url="http://localhost:8080", timeout=60)
+    assert ef.name() == "llamacpp"
+
+
+def test_llamacpp_ef_call_batch(monkeypatch):
+    """__call__([text1, text2]) → 两个 1024 维向量
+    实测响应格式：根是 list，每项 {"index":N, "embedding":[[1024 floats]]}"""
+    from unittest.mock import MagicMock, patch
+    from mempalace.embedding import LlamacppEF
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = [
+        {"index": 0, "embedding": [[0.1] * 1024]},
+        {"index": 1, "embedding": [[0.2] * 1024]},
+    ]
+    with patch("requests.post", return_value=fake_resp) as mock_post:
+        ef = LlamacppEF(url="http://localhost:8080", timeout=60)
+        result = ef(["hello", "world"])
+
+    assert len(result) == 2
+    assert len(result[0]) == 1024
+    assert result[0][0] == 0.1
+    assert result[1][0] == 0.2
+    # 验证 POST 到 /embeddings（带 s！），请求体里 content 是列表
+    args, kwargs = mock_post.call_args
+    assert args[0] == "http://localhost:8080/embeddings"
+    assert kwargs["json"] == {"content": ["hello", "world"]}
+
+
+def test_llamacpp_ef_call_string_wraps_as_list(monkeypatch):
+    """bare string → 自动包成单元素列表（避免按字符迭代）"""
+    from unittest.mock import MagicMock, patch
+    from mempalace.embedding import LlamacppEF
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = [{"index": 0, "embedding": [[0.1] * 1024]}]
+    with patch("requests.post", return_value=fake_resp):
+        ef = LlamacppEF(url="http://localhost:8080", timeout=60)
+        result = ef("hello")
+    assert len(result) == 1
+    assert len(result[0]) == 1024
+
+
+def test_llamacpp_ef_empty_input_skips_request(monkeypatch):
+    """空输入 → 直接返回 []，不发请求"""
+    from unittest.mock import patch
+    from mempalace.embedding import LlamacppEF
+
+    with patch("requests.post") as mock_post:
+        ef = LlamacppEF(url="http://localhost:8080", timeout=60)
+        assert ef([]) == []
+        assert ef(None) == []
+        mock_post.assert_not_called()

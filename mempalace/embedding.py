@@ -36,6 +36,8 @@ import os
 import threading
 from typing import Optional
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 _PROVIDER_MAP = {
@@ -239,6 +241,115 @@ _OLLAMA_DEFAULT_TIMEOUT = 60  # 秒
 # a meaningful vector and surface real failure modes during probe.
 _OLLAMA_HEALTH_PROBE = "mempalace embedding health check"
 
+# llama.cpp embedding backend -- 通过 mempalace 自管的 llama-server 子进程
+# 做 embedding。激活方式：MEMPALACE_EMBEDDING_MODEL=llamacpp。
+#
+# 跟前两种 backend 的根本区别：
+# - minilm / embeddinggemma 在 mempalace 进程内做推理（onnxruntime）
+# - llamacpp 走外部进程 + HTTP，由 _llamacpp_server.ensure_running()
+#   按需 spawn、绑定 Job Object、健康探测、log 抓取
+#
+# 跟旧 Ollama 路径的根本区别：旧路径 mempalace 只是个 HTTP 客户端，
+# Ollama daemon 由用户手动启动；新路径子进程归 mempalace 管。
+#
+# 切换到 llamacpp 改变 EF name() → "llamacpp"，跟旧 collection 不兼容，
+# 必须 mempalace repair --yes 重建索引。
+_LLAMACPP_HEALTH_PROBE = "mempalace embedding health check"
+
+
+class LlamacppEF:
+    """ChromaDB-compatible EF，调用本地 llama-server 的 /embeddings 端点（带 s，非 OAI 兼容版）。
+
+    实例化时不立刻发请求；首次调用 __call__ 时通过
+    _llamacpp_server.ensure_running() 保证服务在跑（lazy spawn）。
+
+    Batch chunking 边界：本类**不做内部 batch 切分**，假设调用方
+    （ChromaDB / mempalace miner / searcher）已按合理大小切好。
+    ChromaDB 内部 ONNX EF 用 batch_size=32 的语义在这里同样适用——
+    实际 mempalace 调用点的 batch ≤ 几十条 drawer，远低于会让单次
+    HTTP POST 出问题的规模。如果未来有人直接传 1000+ 条进来，要么
+    在调用方加切分，要么改这里。
+    """
+
+    def __init__(self, url: str, timeout: int):
+        self._url = url
+        self._timeout = timeout
+
+    @staticmethod
+    def name() -> str:
+        # ChromaDB 把 name() 持久化到 collection 上，读写必须一致。
+        # 跟旧 ollama EF 的 "ollama" 不一样 → 旧 collection 必须 repair 重建。
+        return "llamacpp"
+
+    def __call__(self, input):  # noqa: A002 -- ChromaDB EF 协议
+        """嵌入一组文本，返回 list[list[float]]。
+
+        响应契约（curl 在 llama.cpp b9768 实测 + 对照 README）：
+          - endpoint：POST /embeddings（带 s，非 OAI 兼容）
+          - 根是 list（README 明确写出这个格式）
+          - 每项形如 {"index": 0, "embedding": [[...1024 floats...]]}
+          - embedding 是嵌套数组：外层是 token-chunk 维度
+          - 启动用 --pooling mean，每个 input 只产生 1 个 chunk → 安全取 [0]
+        """
+        if isinstance(input, str):
+            input = [input]
+        if not input:
+            return []
+
+        resp = requests.post(
+            f"{self._url}/embeddings",  # 带 s，非 OAI 兼容端点
+            json={"content": list(input)},
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        return [item["embedding"][0] for item in resp.json()]
+
+    def embed_query(self, input):  # noqa: A002
+        return self(input)
+
+    def embed_documents(self, input):  # noqa: A002
+        return self(input)
+
+
+def _build_llamacpp_ef() -> LlamacppEF:
+    """构造 LlamacppEF 并做 fail-fast 健康探测。
+
+    ensure_running() 保证服务在跑（spawn / 复用 / fail-fast）。然后
+    立即跑一次 embedding 探测语义正确性——_llamacpp_server 的 /health
+    检查只看 HTTP 层，不验证模型真的能输出有效向量。
+    """
+    from mempalace import _llamacpp_server
+
+    url = _llamacpp_server.ensure_running()
+    timeout_raw = os.getenv("MEMPALACE_LLAMACPP_TIMEOUT")
+    try:
+        timeout = int(timeout_raw) if timeout_raw else 60
+    except ValueError as e:
+        raise ValueError(f"MEMPALACE_LLAMACPP_TIMEOUT 必须是整数，收到 {timeout_raw!r}") from e
+    if timeout <= 0:
+        raise ValueError(f"MEMPALACE_LLAMACPP_TIMEOUT 必须是正整数，收到 {timeout}")
+
+    ef = LlamacppEF(url=url, timeout=timeout)
+    try:
+        vec = ef([_LLAMACPP_HEALTH_PROBE])
+    except Exception as e:
+        raise RuntimeError(
+            f"llamacpp embedding 健康探测失败 (url={url}, timeout={timeout}s): {e}。"
+            f"日志：~/.mempalace/llamacpp_server.log"
+        ) from e
+    if not vec or not vec[0]:
+        raise RuntimeError(
+            f"llamacpp 返回空向量。url={url}。日志：~/.mempalace/llamacpp_server.log"
+        )
+
+    logger.info(
+        "llamacpp embedding function initialized (url=%s timeout=%ds dim=%d)",
+        url,
+        timeout,
+        len(vec[0]),
+    )
+    return ef
+
 
 class EmbeddinggemmaONNX:
     """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL→384d).
@@ -408,10 +519,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             return cached
 
         threads = _resolve_intra_op_threads()
-        if model == "ollama":
-            # Ollama 路径不使用 ONNX provider；providers 仍参与 cache key 以与
-            # 现有分支语义一致（同 model 不同 device 仍各自缓存一份）。
-            ef = _build_ollama_ef()
+        if model == "llamacpp":
+            ef = _build_llamacpp_ef()
         elif model == "embeddinggemma":
             ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
         else:
@@ -446,13 +555,9 @@ def _build_ollama_ef():
     try:
         timeout = int(timeout_raw) if timeout_raw else _OLLAMA_DEFAULT_TIMEOUT
     except ValueError as e:
-        raise ValueError(
-            f"MEMPALACE_OLLAMA_TIMEOUT 必须是整数，收到 {timeout_raw!r}"
-        ) from e
+        raise ValueError(f"MEMPALACE_OLLAMA_TIMEOUT 必须是整数，收到 {timeout_raw!r}") from e
     if timeout <= 0:
-        raise ValueError(
-            f"MEMPALACE_OLLAMA_TIMEOUT 必须是正整数，收到 {timeout}"
-        )
+        raise ValueError(f"MEMPALACE_OLLAMA_TIMEOUT 必须是正整数，收到 {timeout}")
 
     from chromadb.utils.embedding_functions.ollama_embedding_function import (
         OllamaEmbeddingFunction,

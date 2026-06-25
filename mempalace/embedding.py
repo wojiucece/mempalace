@@ -241,9 +241,14 @@ _LLAMACPP_HEALTH_PROBE = "mempalace embedding health check"
 # `repair --mode from-sqlite` 直接 upsert(documents=<1449 条整 list>) 不做切分，
 # 导致单次 HTTP POST /embeddings 含上千条文本、llama-server 真在算但客户端 HTTP
 # read timeout（即便 timeout=600s 也不够）。
-# 取值理由：跟 mempalace ChromaDB 内部 ONNX EF 的 batch_size=32 对齐，drawer 平均
-# 几百 token，32 条 × 500 token ≈ 16k token，远低于 llama-server -b 8192 等参数限制。
-_LLAMACPP_MAX_BATCH = 32
+# 取值理由（与 spawn args --ctx-size 8192 配套）：
+#   16 × 500 tokens = 8000，刚好在 ctx 上下文内不溢出
+#   即使个别 chunk 偏长（1000 tokens），16 条 = 16000 tokens，server 会内部
+#   分批处理（--batch-size 4096 决定单次 forward pass 上限），不会丢数据
+#   请求次数：10 万条文本 ≈ 6250 次 HTTP，比 32 多一倍、比 8 少一半，适中
+# 调小到 8 的场景：如果未来 mempalace chunker 改大 chunk_size 到 2000 字符
+#   （≈ 1200 token），16 × 1200 = 19200 > 8192 ctx，应降到 8
+_LLAMACPP_MAX_BATCH = 16
 
 
 class LlamacppEF:

@@ -256,19 +256,19 @@ def test_llamacpp_ef_empty_input_skips_request(monkeypatch):
 
 
 def test_llamacpp_ef_internal_batch_chunking(monkeypatch):
-    """超过 _LLAMACPP_MAX_BATCH 的输入按 32 条/批切分，按顺序拼回。
+    """超过 _LLAMACPP_MAX_BATCH 的输入按 16 条/批切分，按顺序拼回。
 
     Regression: mempalace `repair --mode from-sqlite` 直接 upsert 整个 1449
     条 list，原实现单次 POST 导致 llama-server 端真在算但客户端 read timeout。
-    本测试确保 EF 内部按 32 切片、多次 POST、结果按 input 顺序拼回。
+    本测试确保 EF 内部按 16 切片、多次 POST、结果按 input 顺序拼回。
     """
     from unittest.mock import patch, MagicMock
     from mempalace.embedding import LlamacppEF, _LLAMACPP_MAX_BATCH
 
-    assert _LLAMACPP_MAX_BATCH == 32, "测试假设 batch=32；上限改了请同步更新"
+    assert _LLAMACPP_MAX_BATCH == 16, "测试假设 batch=16；上限改了请同步更新"
 
-    # 构造 40 条输入 → 应触发 2 次 POST：第一批 32 条 + 第二批 8 条
-    inputs = [f"text-{i}" for i in range(40)]
+    # 构造 20 条输入 → 应触发 2 次 POST：第一批 16 条 + 第二批 4 条
+    inputs = [f"text-{i}" for i in range(20)]
 
     def fake_post(url, json, timeout):
         # 按 mempalace b9768 实测响应格式回 mock：响应根是 list，
@@ -289,19 +289,19 @@ def test_llamacpp_ef_internal_batch_chunking(monkeypatch):
 
     # 必须发 2 次 HTTP
     assert mock_post.call_count == 2
-    # 第一次 POST 32 条
+    # 第一次 POST 16 条
     first_payload = mock_post.call_args_list[0].kwargs["json"]["content"]
-    assert len(first_payload) == 32
+    assert len(first_payload) == 16
     assert first_payload[0] == "text-0"
-    assert first_payload[31] == "text-31"
-    # 第二次 POST 8 条
+    assert first_payload[15] == "text-15"
+    # 第二次 POST 4 条
     second_payload = mock_post.call_args_list[1].kwargs["json"]["content"]
-    assert len(second_payload) == 8
-    assert second_payload[0] == "text-32"
-    assert second_payload[7] == "text-39"
-    # 返回 40 条向量，且按 input 顺序拼回
-    assert len(result) == 40
+    assert len(second_payload) == 4
+    assert second_payload[0] == "text-16"
+    assert second_payload[3] == "text-19"
+    # 返回 20 条向量，且按 input 顺序拼回
+    assert len(result) == 20
     assert result[0][0] == 0.0
-    assert result[31][0] == 31.0
-    assert result[32][0] == 32.0
-    assert result[39][0] == 39.0
+    assert result[15][0] == 15.0
+    assert result[16][0] == 16.0
+    assert result[19][0] == 19.0

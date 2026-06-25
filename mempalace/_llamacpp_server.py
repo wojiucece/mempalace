@@ -313,18 +313,17 @@ def _spawn(url: str) -> subprocess.Popen:
         / "Qwen3-Embedding-0.6B-Q8_0.gguf"
     )
 
-    # 启动参数写死。调优依据（i5-12500H + 16GB + CPU 推理）：
+    # 调优依据（i5-12500H + 16GB + CPU 推理）：
     #   --threads 8        避开 P 核（8 逻辑线程）+ E 核大小核调度陷阱
-    #   --ctx-size 4096    embedding 不需要 32k 上下文；但 mempalace drawer
-    #                      偶尔有 1500+ token 的长 chunk（如 CLAUDE.md 文档），
-    #                      ctx 2048 不够安全余量，4096 兼顾内存与覆盖率
+    #   --ctx-size 8192    embedding 上下文窗口；mempalace drawer 偶尔
+    #                      1500+ token（CLAUDE.md 等长文档），8192 留余量
     #   --batch-size 4096 / --ubatch-size 4096
     #                      physical batch 必须 >= 单条 input token 数，
-    #                      否则 llama-server 返 500 "input is too large to process"。
-    #                      mempalace drawer 偶尔 500-1500 token，开 4096 留余量。
-    #   --no-mmap          16GB RAM、模型 700MB，直接全量装内存避免 page fault
+    #                      否则 llama-server 返 500 "input is too large to process"
+    #   --mlock            锁热点页面在物理内存，避开 swap 抖动
     #   --parallel 2       i5-12500H 同时跑 2 个 batch 不堵塞
-    #   --flash-attn on    llama.cpp 也有 CPU FA 优化，~10-20% 提速（b9768 需显式值）
+    #   不指定 --pooling   用模型默认 last-token pooling
+    #                      （Qwen3-Embedding 官方 HuggingFace README 的训练时设置）
     args = [
         str(_LLAMA_SERVER_BIN),
         "-m",
@@ -332,21 +331,17 @@ def _spawn(url: str) -> subprocess.Popen:
         "--embedding",
         "--port",
         str(port),
-        "--pooling",
-        "mean",
         "--threads",
         "8",
         "--ctx-size",
-        "4096",
+        "8192",
         "--batch-size",
         "4096",
         "--ubatch-size",
         "4096",
-        "--no-mmap",
+        "--mlock",
         "--parallel",
         "2",
-        "--flash-attn",
-        "on",
         "-ngl",
         "0",
     ]
